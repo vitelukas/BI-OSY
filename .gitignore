@@ -1,0 +1,10 @@
+**/*.out
+**/*.log
+**/*.sh
+**/cmake.*
+**/.idea
+**/.vscode
+**/*.o
+
+**/*lab*
+**/*proseminar*
