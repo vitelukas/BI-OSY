@@ -72,8 +72,10 @@ void CCompanyTest::solvedPack(AProblemPack pack) {
         if (g_Data.begin()[idx].m_Polygon != p)
             throw std::invalid_argument("solvedPack: order not preserved");
 
-        if (!smallDiff(p->m_TriangMin, g_Data.begin()[idx].m_TriangMin))
+        if (!smallDiff(p->m_TriangMin, g_Data.begin()[idx].m_TriangMin)) {
+            printf("***** TriangMin: %f != %f *****n", p->m_TriangMin, g_Data.begin()[idx].m_TriangMin);
             throw std::invalid_argument("solvedPack: invalid result (TriangMin)");
+        }
     }
 
     for (auto p : pack->m_ProblemsCnt) {
@@ -85,8 +87,10 @@ void CCompanyTest::solvedPack(AProblemPack pack) {
         if (g_Data.begin()[idx].m_Polygon != p)
             throw std::invalid_argument("solvedPack: order not preserved");
 
-        if (p->m_TriangCnt != CBigInt(g_Data.begin()[idx].m_TriangCnt))
+        if (p->m_TriangCnt != CBigInt(g_Data.begin()[idx].m_TriangCnt)) {
+            printf("***** TriangMin: %s != %s *****\n", p->m_TriangCnt.toString().c_str(), g_Data.begin()[idx].m_TriangCnt);
             throw std::invalid_argument("solvedPack: invalid result (TriangCnt)");
+        }
     }
 }
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------
