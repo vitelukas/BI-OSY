@@ -154,7 +154,6 @@ void COptimizer::start(int threadCount) {
 }
 
 void COptimizer::stop(void) {
-    printf("\n### STOP CALLED ###\n\n");
     endOfShift = true;
 
     // Wait for all communication to receive the package they are actually waiting for
@@ -162,13 +161,11 @@ void COptimizer::stop(void) {
     for (auto &receiverThread : m_commReceiveThreads) {
         receiverThread.join();
     }
-    // printf("### Stop called: all receiver threads terminated ###\n");
 
     m_SolvePacksCV.notify_all();
     for (auto &workThread : m_workThreads) {
         workThread.join();
     }
-    // printf("### Stop called: all worker threads terminated ###\n");
 
     for (auto &company : m_Companies) {
         company->m_SendPacksCV.notify_all();
@@ -176,14 +173,12 @@ void COptimizer::stop(void) {
     for (auto &senderThread : m_commSendThreads) {
         senderThread.join();
     }
-    printf("\n###__ SENDERS ENDING __###\n\n");
 }
 
 //| ------------------------------------------------------custom helper functions------------------------------------------------------
 
 void COptimizer::commThrRecv(shared_ptr<SCompany> Scomp) {
     while (true) {
-        printf("__busy waiting: receive__\n");
 
         AProblemPack newPack = Scomp->m_company->waitForPack();
 
@@ -200,7 +195,6 @@ void COptimizer::commThrRecv(shared_ptr<SCompany> Scomp) {
         Scomp->m_PackagesMutex.lock();
         Scomp->m_problemPacks.push(packPtr);
         Scomp->m_PackagesMutex.unlock();
-        // printf("RECEIVED |     ID: %ld   Size: %ld        number of probs: MIN:%ld  |  CNT:%ld\n", packPtr->m_packID, packPtr->m_numOfProbs, newPack->m_ProblemsMin.size(), newPack->m_ProblemsCnt.size());
 
         //| Also possible to create a helper thread here, which would simultaneously add problems from
         //| the CNT vector in the new pack into the CNT solver
@@ -222,7 +216,6 @@ void COptimizer::loadProbPckMin(shared_ptr<SProbPack> packPtr) {
         bool success = m_SolverMin.m_solver->addPolygon(polygon);
 
         if (!m_SolverMin.m_solver->hasFreeCapacity()) {
-            // printf("__Pushing MIN solver into the queue\n");
             unique_lock<mutex> queLock(m_SolversQueMutex);
             m_ReadySolversQue.push(m_SolverMin);
             queLock.unlock();
@@ -236,7 +229,6 @@ void COptimizer::loadProbPckMin(shared_ptr<SProbPack> packPtr) {
         }
 
         m_SolverMin.m_counts[packPtr]++;
-        // printf("ID: %ld     MIN_solver      has %ld problems inside\n", packPtr->m_packID, m_SolverMin.m_counts[packPtr]);
     }
 }
 
@@ -246,7 +238,6 @@ void COptimizer::loadProbPckCnt(shared_ptr<SProbPack> packPtr) {
         bool success = m_SolverCnt.m_solver->addPolygon(polygon);
 
         if (!m_SolverCnt.m_solver->hasFreeCapacity()) {
-            // printf("__Pushing CNT solver into the queue\n");
             unique_lock<mutex> queLock(m_SolversQueMutex);
             m_ReadySolversQue.push(m_SolverCnt);
             queLock.unlock();
@@ -260,7 +251,6 @@ void COptimizer::loadProbPckCnt(shared_ptr<SProbPack> packPtr) {
         }
 
         m_SolverCnt.m_counts[packPtr]++;
-        // printf("ID: %ld     CNT_solver      has %ld problems inside\n", packPtr->m_packID, m_SolverCnt.m_counts[packPtr]);
     }
 }
 
@@ -268,7 +258,6 @@ void COptimizer::handleLastRecvThread() {
     m_numOfInactiveRecvThreads++;
     m_numOfInactiveRecvThreads.load() == m_Companies.size() ? isReceiving = false : 0;
     if (isReceiving == false) {
-        printf("\n###__ RECEIVERS ENDING __###\n\n");
         m_ReadySolversQue.push(m_SolverMin);
         m_ReadySolversQue.push(m_SolverCnt);
         m_SolvePacksCV.notify_all();
@@ -277,17 +266,14 @@ void COptimizer::handleLastRecvThread() {
 
 void COptimizer::workThr(void) {
     while (true) {
-        printf("__busy waiting: work__\n");
         unique_lock<mutex> queLock(m_SolversQueMutex);
         //? Stay awake until there are some ready solvers in the buffer to be picked up
         m_SolvePacksCV.wait(queLock, [this] { return m_ReadySolversQue.empty() == false || isReceiving == false; });
         if (m_ReadySolversQue.empty() && !isReceiving && !endOfShift) {
             //? The queue is empty and the communication threads are not receiving any next packages,
             //? but the shift is not over yet -> go to sleep and wait for a notification
-            printf("goind to sleep .... empty que and inactive receivers but shift not over yet\n");
             m_SolvePacksCV.wait(queLock, [this] { return endOfShift; });
             //? Stop() hase been called -> terminating
-            printf("###__ worker ending ... end of shift __###\n\n");
             handleEndingWorkThread();
             return;
         } else if (m_ReadySolversQue.empty() && endOfShift) {
@@ -301,13 +287,9 @@ void COptimizer::workThr(void) {
         m_ReadySolversQue.pop();
         queLock.unlock();
         readySolverStruct.m_solver->solve();
-        // printf("\n==== There are %ld different packs in the current solver ====\n", readySolverStruct.m_counts.size());
         for (auto &pack : readySolverStruct.m_counts) {
             unique_lock<mutex> packLock(pack.first->m_solverdProbsMutex);
             pack.first->m_solvedProbsCounter += pack.second;
-            // printf("~~~ Adding %ld solved problems to pack with ID: %ld  ~~~\n", pack.second, pack.first->m_packID);
-            // printf("          After addition: numOfSolvedProbs = %ld  ~~~\n", pack.first->m_solvedProbsCounter);
-            // printf("                          num of all probs = %ld  ~~~\n", pack.first->m_numOfProbs);
             if (pack.first->m_numOfProbs == pack.first->m_solvedProbsCounter) {
                 pack.first->solved = true;
                 pack.first->m_owner->m_SendPacksCV.notify_one();
@@ -319,26 +301,21 @@ void COptimizer::workThr(void) {
 void COptimizer::handleEndingWorkThread() {
     m_numOfActiveWorkThreads--;
     if (m_numOfActiveWorkThreads.load() == 0) {
-        printf("\n###__ WORKERS ENDING __###\n\n");
         workersActive = false;
     }
 }
 
 void COptimizer::commThrSend(shared_ptr<SCompany> Scomp) {
     while (true) {
-        printf("__busy waiting: send__\n");
         unique_lock<mutex> lock(Scomp->m_PackagesMutex);
-        // printf("### number of packs in heap -> %ld ###\n", Scomp->m_problemPacks.size());
         Scomp->m_SendPacksCV.wait(lock, [this, &Scomp] { return (!Scomp->m_problemPacks.empty() && Scomp->m_problemPacks.front()->solved) || !workersActive; });
         if (Scomp->m_problemPacks.empty() && !workersActive) {
             //? The company stopped sending packages or stop() has been called
             //? and there are no more packages in the storage to be sent -> terminate the sender tread
-            // printf("### Stop called: terminating sender thread ###\n");
             return;
         }
         //? Until there are some solved packages in the minimal heap, send them
         shared_ptr<SProbPack> topPack = Scomp->m_problemPacks.front();
-        // printf("@@@@ SENDING |     ID: %ld   Size: %ld ... Solved probs: %ld ... solved = %s\n", topPack->m_packID, topPack->m_numOfProbs, topPack->m_solvedProbsCounter, (topPack->solved ? "true" : "false"));
         Scomp->m_company->solvedPack(topPack->m_problemPack);
         Scomp->m_problemPacks.pop();
     }
