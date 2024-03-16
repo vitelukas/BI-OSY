@@ -72,7 +72,7 @@ struct SSolver {
     AProgtestSolver m_solver = nullptr;
     // Keps count how many problems from a single problem pack
     // were added into the current solver instance
-    unordered_map<shared_ptr<SProbPack>, size_t> m_counts;
+    unordered_map<shared_ptr<SProbPack>, size_t> m_counts = {};
 };
 
 //| ------------------------------------------------------------------------------------------
@@ -104,6 +104,7 @@ private:
     void workThr();
     void handleLastRecvThread();
     void handleEndingWorkThread();
+    void continuityCheck();
 
     vector<shared_ptr<SCompany>> m_Companies;
     vector<thread> m_workThreads;
@@ -130,6 +131,11 @@ private:
     mutex m_SolverMinMutex;
     mutex m_SolverCntMutex;
     condition_variable m_SolvePacksCV;
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    atomic<size_t> numberOfReceivedPacks = 0;
+    atomic<size_t> numberOfSentPacks = 0;
+    atomic<size_t> receivedProbs = 0;
+    atomic<size_t> probsInSolver = 0;
 };
 //| ------------------------------------------------------------------------------------------
 // Register a new company
@@ -161,11 +167,13 @@ void COptimizer::stop(void) {
     for (auto &receiverThread : m_commReceiveThreads) {
         receiverThread.join();
     }
+    printf("### RECEIVER THREADS ENDED ###\n");
 
     m_SolvePacksCV.notify_all();
     for (auto &workThread : m_workThreads) {
         workThread.join();
     }
+    printf("### WORKER THREADS ENDED ###\n");
 
     for (auto &company : m_Companies) {
         company->m_SendPacksCV.notify_all();
@@ -173,25 +181,58 @@ void COptimizer::stop(void) {
     for (auto &senderThread : m_commSendThreads) {
         senderThread.join();
     }
+    printf("### SENDER THREADS ENDED ###\n");
+
+    printf("\n_____ number of received problems: %lu ..... %lu number of problems in solver____\n", receivedProbs.load(), probsInSolver.load());
 }
 
 //| ------------------------------------------------------custom helper functions------------------------------------------------------
 
+void COptimizer::continuityCheck() {
+    size_t packTest = 18;
+    if (numberOfReceivedPacks.load() == packTest) {
+        unique_lock<mutex> queLock(m_SolversQueMutex);
+        m_ReadySolversQue.push(m_SolverCnt);
+        m_ReadySolversQue.push(m_SolverMin);
+        queLock.unlock();
+        m_SolverCntMutex.lock();
+        m_SolverMinMutex.lock();
+        m_SolverCnt.m_solver = createProgtestCntSolver();
+        m_SolverCnt.m_counts.clear();
+        m_SolverMin.m_solver = createProgtestMinSolver();
+        m_SolverMin.m_counts.clear();
+        m_SolverMinMutex.unlock();
+        m_SolverCntMutex.unlock();
+        m_SolvePacksCV.notify_one();
+        printf("__sent waiting for %lu packs to be sent ... initiating sleep__\n", packTest);
+        while (numberOfSentPacks.load() < packTest) {
+            printf("...sleeping\n");
+            this_thread::sleep_for(chrono::milliseconds(400));
+        }
+        printf("__waking up: %lu packs successfully received__\n", packTest);
+    }
+    numberOfReceivedPacks++;
+    printf("== number of received packs: %lu ==\n", numberOfReceivedPacks.load());
+}
+
 void COptimizer::commThrRecv(shared_ptr<SCompany> Scomp) {
     while (true) {
-
         AProblemPack newPack = Scomp->m_company->waitForPack();
 
         if (!newPack) {
             handleLastRecvThread();
             return;
         }
+
+        continuityCheck();
+
         // initialize a new problem pack in the company
         shared_ptr<SProbPack> packPtr = make_shared<SProbPack>();
         packPtr->m_problemPack = newPack;
         packPtr->m_packID = Scomp->m_nxtPackID++;
         packPtr->m_owner = Scomp;
-        packPtr->m_numOfProbs += (newPack->m_ProblemsCnt.size() + newPack->m_ProblemsMin.size());
+        packPtr->m_numOfProbs = (newPack->m_ProblemsCnt.size() + newPack->m_ProblemsMin.size());
+        receivedProbs += packPtr->m_numOfProbs;
         Scomp->m_PackagesMutex.lock();
         Scomp->m_problemPacks.push(packPtr);
         Scomp->m_PackagesMutex.unlock();
@@ -213,44 +254,34 @@ void COptimizer::commThrRecv(shared_ptr<SCompany> Scomp) {
 void COptimizer::loadProbPckMin(shared_ptr<SProbPack> packPtr) {
     for (auto &polygon : packPtr->m_problemPack->m_ProblemsMin) {
 
-        bool success = m_SolverMin.m_solver->addPolygon(polygon);
+        m_SolverMin.m_solver->addPolygon(polygon);
+        m_SolverMin.m_counts[packPtr]++;
 
         if (!m_SolverMin.m_solver->hasFreeCapacity()) {
             unique_lock<mutex> queLock(m_SolversQueMutex);
             m_ReadySolversQue.push(m_SolverMin);
             queLock.unlock();
+            m_SolvePacksCV.notify_one();
             m_SolverMin.m_solver = createProgtestMinSolver();
             m_SolverMin.m_counts.clear();
-            m_SolvePacksCV.notify_one();
-
-            if (!success) {
-                m_SolverMin.m_solver->addPolygon(polygon);
-            }
         }
-
-        m_SolverMin.m_counts[packPtr]++;
     }
 }
 
 void COptimizer::loadProbPckCnt(shared_ptr<SProbPack> packPtr) {
     for (auto &polygon : packPtr->m_problemPack->m_ProblemsCnt) {
 
-        bool success = m_SolverCnt.m_solver->addPolygon(polygon);
+        m_SolverCnt.m_solver->addPolygon(polygon);
+        m_SolverCnt.m_counts[packPtr]++;
 
         if (!m_SolverCnt.m_solver->hasFreeCapacity()) {
             unique_lock<mutex> queLock(m_SolversQueMutex);
             m_ReadySolversQue.push(m_SolverCnt);
             queLock.unlock();
+            m_SolvePacksCV.notify_one();
             m_SolverCnt.m_solver = createProgtestCntSolver();
             m_SolverCnt.m_counts.clear();
-            m_SolvePacksCV.notify_one();
-
-            if (!success) {
-                m_SolverCnt.m_solver->addPolygon(polygon);
-            }
         }
-
-        m_SolverCnt.m_counts[packPtr]++;
     }
 }
 
@@ -258,6 +289,7 @@ void COptimizer::handleLastRecvThread() {
     m_numOfInactiveRecvThreads++;
     m_numOfInactiveRecvThreads.load() == m_Companies.size() ? isReceiving = false : 0;
     if (isReceiving == false) {
+        unique_lock<mutex> queLock(m_SolversQueMutex);
         m_ReadySolversQue.push(m_SolverMin);
         m_ReadySolversQue.push(m_SolverCnt);
         m_SolvePacksCV.notify_all();
@@ -290,10 +322,11 @@ void COptimizer::workThr(void) {
         for (auto &pack : readySolverStruct.m_counts) {
             unique_lock<mutex> packLock(pack.first->m_solverdProbsMutex);
             pack.first->m_solvedProbsCounter += pack.second;
-            if (pack.first->m_numOfProbs == pack.first->m_solvedProbsCounter) {
+            if (pack.first->m_numOfProbs <= pack.first->m_solvedProbsCounter) {
                 pack.first->solved = true;
                 pack.first->m_owner->m_SendPacksCV.notify_one();
             }
+            probsInSolver += pack.second;
         }
     }
 }
@@ -309,6 +342,7 @@ void COptimizer::commThrSend(shared_ptr<SCompany> Scomp) {
     while (true) {
         unique_lock<mutex> lock(Scomp->m_PackagesMutex);
         Scomp->m_SendPacksCV.wait(lock, [this, &Scomp] { return (!Scomp->m_problemPacks.empty() && Scomp->m_problemPacks.front()->solved) || !workersActive; });
+        printf("...sender thread woke up... there are %lu packages in the storage of company - %lu \n", Scomp->m_problemPacks.size(), (unsigned long)pthread_self());
         if (Scomp->m_problemPacks.empty() && !workersActive) {
             //? The company stopped sending packages or stop() has been called
             //? and there are no more packages in the storage to be sent -> terminate the sender tread
@@ -318,6 +352,8 @@ void COptimizer::commThrSend(shared_ptr<SCompany> Scomp) {
         shared_ptr<SProbPack> topPack = Scomp->m_problemPacks.front();
         Scomp->m_company->solvedPack(topPack->m_problemPack);
         Scomp->m_problemPacks.pop();
+        numberOfSentPacks++;
+        printf("== number of sent packs: %lu ==\n", numberOfSentPacks.load());
     }
 }
 
@@ -326,7 +362,10 @@ void COptimizer::commThrSend(shared_ptr<SCompany> Scomp) {
 int main(void) {
     COptimizer optimizer;
     ACompanyTest company = std::make_shared<CCompanyTest>();
-    optimizer.addCompany(company);
+    for (size_t i = 0; i < 2; i++) {
+        company = std::make_shared<CCompanyTest>();
+        optimizer.addCompany(company);
+    }
     optimizer.start(4);
     optimizer.stop();
     if (!company->allProcessed())
