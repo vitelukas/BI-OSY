@@ -46,12 +46,11 @@ struct SProbPack {
     SProbPack() = default;
 
     AProblemPack m_problemPack;
-    size_t m_packID = 0;
-    bool solved = false;
     shared_ptr<SCompany> m_owner = nullptr;
-    mutex m_solverdProbsMutex;
+    mutex m_packMutex;
     size_t m_solvedProbsCounter = 0;
     size_t m_numOfProbs = 0;
+    bool solved = false;
 };
 
 struct SCompany {
@@ -61,9 +60,8 @@ struct SCompany {
 
     ACompany m_company;
     queue<shared_ptr<SProbPack>> m_problemPacks;
-    mutex m_PackagesMutex;
-    condition_variable m_SendPacksCV;
-    size_t m_nxtPackID = 0;
+    mutex m_packagesMutex;
+    condition_variable m_sendPacksCV;
 };
 
 struct SSolver {
@@ -104,7 +102,6 @@ private:
     void workThr();
     void handleLastRecvThread();
     void handleEndingWorkThread();
-    void continuityCheck();
 
     vector<shared_ptr<SCompany>> m_Companies;
     vector<thread> m_workThreads;
@@ -131,11 +128,6 @@ private:
     mutex m_SolverMinMutex;
     mutex m_SolverCntMutex;
     condition_variable m_SolvePacksCV;
-    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    atomic<size_t> numberOfReceivedPacks = 0;
-    atomic<size_t> numberOfSentPacks = 0;
-    atomic<size_t> receivedProbs = 0;
-    atomic<size_t> probsInSolver = 0;
 };
 //| ------------------------------------------------------------------------------------------
 // Register a new company
@@ -167,53 +159,21 @@ void COptimizer::stop(void) {
     for (auto &receiverThread : m_commReceiveThreads) {
         receiverThread.join();
     }
-    printf("### RECEIVER THREADS ENDED ###\n");
 
     m_SolvePacksCV.notify_all();
     for (auto &workThread : m_workThreads) {
         workThread.join();
     }
-    printf("### WORKER THREADS ENDED ###\n");
 
     for (auto &company : m_Companies) {
-        company->m_SendPacksCV.notify_all();
+        company->m_sendPacksCV.notify_all();
     }
     for (auto &senderThread : m_commSendThreads) {
         senderThread.join();
     }
-    printf("### SENDER THREADS ENDED ###\n");
-
-    printf("\n_____ number of received problems: %lu ..... %lu number of problems in solver____\n", receivedProbs.load(), probsInSolver.load());
 }
 
 //| ------------------------------------------------------custom helper functions------------------------------------------------------
-
-void COptimizer::continuityCheck() {
-    size_t packTest = 18;
-    if (numberOfReceivedPacks.load() == packTest) {
-        unique_lock<mutex> queLock(m_SolversQueMutex);
-        m_ReadySolversQue.push(m_SolverCnt);
-        m_ReadySolversQue.push(m_SolverMin);
-        queLock.unlock();
-        m_SolverCntMutex.lock();
-        m_SolverMinMutex.lock();
-        m_SolverCnt.m_solver = createProgtestCntSolver();
-        m_SolverCnt.m_counts.clear();
-        m_SolverMin.m_solver = createProgtestMinSolver();
-        m_SolverMin.m_counts.clear();
-        m_SolverMinMutex.unlock();
-        m_SolverCntMutex.unlock();
-        m_SolvePacksCV.notify_one();
-        printf("__sent waiting for %lu packs to be sent ... initiating sleep__\n", packTest);
-        while (numberOfSentPacks.load() < packTest) {
-            printf("...sleeping\n");
-            this_thread::sleep_for(chrono::milliseconds(400));
-        }
-        printf("__waking up: %lu packs successfully received__\n", packTest);
-    }
-    numberOfReceivedPacks++;
-    printf("== number of received packs: %lu ==\n", numberOfReceivedPacks.load());
-}
 
 void COptimizer::commThrRecv(shared_ptr<SCompany> Scomp) {
     while (true) {
@@ -224,18 +184,14 @@ void COptimizer::commThrRecv(shared_ptr<SCompany> Scomp) {
             return;
         }
 
-        continuityCheck();
-
-        // initialize a new problem pack in the company
+        // initialize a new problem pack in the company storage
         shared_ptr<SProbPack> packPtr = make_shared<SProbPack>();
         packPtr->m_problemPack = newPack;
-        packPtr->m_packID = Scomp->m_nxtPackID++;
         packPtr->m_owner = Scomp;
         packPtr->m_numOfProbs = (newPack->m_ProblemsCnt.size() + newPack->m_ProblemsMin.size());
-        receivedProbs += packPtr->m_numOfProbs;
-        Scomp->m_PackagesMutex.lock();
+        Scomp->m_packagesMutex.lock();
         Scomp->m_problemPacks.push(packPtr);
-        Scomp->m_PackagesMutex.unlock();
+        Scomp->m_packagesMutex.unlock();
 
         //| Also possible to create a helper thread here, which would simultaneously add problems from
         //| the CNT vector in the new pack into the CNT solver
@@ -253,35 +209,37 @@ void COptimizer::commThrRecv(shared_ptr<SCompany> Scomp) {
 
 void COptimizer::loadProbPckMin(shared_ptr<SProbPack> packPtr) {
     for (auto &polygon : packPtr->m_problemPack->m_ProblemsMin) {
-
         m_SolverMin.m_solver->addPolygon(polygon);
         m_SolverMin.m_counts[packPtr]++;
 
-        if (!m_SolverMin.m_solver->hasFreeCapacity()) {
-            unique_lock<mutex> queLock(m_SolversQueMutex);
-            m_ReadySolversQue.push(m_SolverMin);
-            queLock.unlock();
-            m_SolvePacksCV.notify_one();
-            m_SolverMin.m_solver = createProgtestMinSolver();
-            m_SolverMin.m_counts.clear();
-        }
+        if (m_SolverMin.m_solver->hasFreeCapacity())
+            continue;
+
+        // if the current solver is full -> push it into the buffer and create a new one
+        unique_lock<mutex> queLock(m_SolversQueMutex);
+        m_ReadySolversQue.push(m_SolverMin);
+        queLock.unlock();
+        m_SolvePacksCV.notify_one();
+        m_SolverMin.m_solver = createProgtestMinSolver();
+        m_SolverMin.m_counts.clear();
     }
 }
 
 void COptimizer::loadProbPckCnt(shared_ptr<SProbPack> packPtr) {
     for (auto &polygon : packPtr->m_problemPack->m_ProblemsCnt) {
-
         m_SolverCnt.m_solver->addPolygon(polygon);
         m_SolverCnt.m_counts[packPtr]++;
 
-        if (!m_SolverCnt.m_solver->hasFreeCapacity()) {
-            unique_lock<mutex> queLock(m_SolversQueMutex);
-            m_ReadySolversQue.push(m_SolverCnt);
-            queLock.unlock();
-            m_SolvePacksCV.notify_one();
-            m_SolverCnt.m_solver = createProgtestCntSolver();
-            m_SolverCnt.m_counts.clear();
-        }
+        if (m_SolverCnt.m_solver->hasFreeCapacity())
+            continue;
+
+        // if the current solver is full -> push it into the buffer and create a new one
+        unique_lock<mutex> queLock(m_SolversQueMutex);
+        m_ReadySolversQue.push(m_SolverCnt);
+        queLock.unlock();
+        m_SolvePacksCV.notify_one();
+        m_SolverCnt.m_solver = createProgtestCntSolver();
+        m_SolverCnt.m_counts.clear();
     }
 }
 
@@ -305,7 +263,7 @@ void COptimizer::workThr(void) {
             //? The queue is empty and the communication threads are not receiving any next packages,
             //? but the shift is not over yet -> go to sleep and wait for a notification
             m_SolvePacksCV.wait(queLock, [this] { return endOfShift; });
-            //? Stop() hase been called -> terminating
+            //? Stop() hase been called -> terminating the thread
             handleEndingWorkThread();
             return;
         } else if (m_ReadySolversQue.empty() && endOfShift) {
@@ -320,40 +278,35 @@ void COptimizer::workThr(void) {
         queLock.unlock();
         readySolverStruct.m_solver->solve();
         for (auto &pack : readySolverStruct.m_counts) {
-            unique_lock<mutex> packLock(pack.first->m_solverdProbsMutex);
+            unique_lock<mutex> packLock(pack.first->m_packMutex);
             pack.first->m_solvedProbsCounter += pack.second;
-            if (pack.first->m_numOfProbs <= pack.first->m_solvedProbsCounter) {
+            if (pack.first->m_numOfProbs == pack.first->m_solvedProbsCounter) {
                 pack.first->solved = true;
-                pack.first->m_owner->m_SendPacksCV.notify_one();
+                pack.first->m_owner->m_sendPacksCV.notify_one();
             }
-            probsInSolver += pack.second;
         }
     }
 }
 
 void COptimizer::handleEndingWorkThread() {
     m_numOfActiveWorkThreads--;
-    if (m_numOfActiveWorkThreads.load() == 0) {
+    if (m_numOfActiveWorkThreads.load() == 0)
         workersActive = false;
-    }
 }
 
 void COptimizer::commThrSend(shared_ptr<SCompany> Scomp) {
     while (true) {
-        unique_lock<mutex> lock(Scomp->m_PackagesMutex);
-        Scomp->m_SendPacksCV.wait(lock, [this, &Scomp] { return (!Scomp->m_problemPacks.empty() && Scomp->m_problemPacks.front()->solved) || !workersActive; });
-        printf("...sender thread woke up... there are %lu packages in the storage of company - %lu \n", Scomp->m_problemPacks.size(), (unsigned long)pthread_self());
+        unique_lock<mutex> lock(Scomp->m_packagesMutex);
+        Scomp->m_sendPacksCV.wait(lock, [this, &Scomp] { return (!Scomp->m_problemPacks.empty() && Scomp->m_problemPacks.front()->solved) || !workersActive; });
         if (Scomp->m_problemPacks.empty() && !workersActive) {
             //? The company stopped sending packages or stop() has been called
-            //? and there are no more packages in the storage to be sent -> terminate the sender tread
+            //? and there are no more packages in the storage to be sent -> terminate the sender thread
             return;
         }
         //? Until there are some solved packages in the minimal heap, send them
         shared_ptr<SProbPack> topPack = Scomp->m_problemPacks.front();
         Scomp->m_company->solvedPack(topPack->m_problemPack);
         Scomp->m_problemPacks.pop();
-        numberOfSentPacks++;
-        printf("== number of sent packs: %lu ==\n", numberOfSentPacks.load());
     }
 }
 
